@@ -1,4 +1,4 @@
-# ComfyUI-QwenVL (GGUF) - 优化版：默认启用本地文件，支持多图分析
+# ComfyUI-QwenVL (GGUF) - 优化版：支持Qwen2.5-VL和多图分析
 
 import base64
 import gc
@@ -7,6 +7,7 @@ import inspect
 import json
 import os
 import time
+import random
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -71,6 +72,7 @@ class GGUFVLResolved:
     gpu_layers: int
     top_k: int
     pool_size: int
+    model_family: str = "unknown"
 
 
 def _resolve_base_dir(base_dir_value: str) -> Path:
@@ -101,6 +103,88 @@ def _model_name_to_filename_candidates(model_name: str) -> set[str]:
     return candidates
 
 
+def _detect_model_family_from_filename(filename: str) -> str:
+    """从文件名检测模型家族"""
+    filename_lower = filename.lower()
+    
+    # 精确匹配
+    if "qwen2.5" in filename_lower or "qwen2_5" in filename_lower:
+        return "qwen2.5-vl"
+    elif "qwen3" in filename_lower:
+        return "qwen3-vl"
+    elif "qwen2" in filename_lower:
+        return "qwen2-vl"
+    elif "qwen-vl" in filename_lower:
+        return "qwen-vl"
+    elif "llava-1.6" in filename_lower:
+        return "llava-1.6"
+    elif "llava-1.5" in filename_lower:
+        return "llava-1.5"
+    elif "llava" in filename_lower:
+        return "llava"
+    elif "bakllava" in filename_lower:
+        return "bakllava"
+    elif "minicpm" in filename_lower:
+        return "minicpm"
+    elif "cogvlm" in filename_lower:
+        return "cogvlm"
+    elif "yi-vl" in filename_lower:
+        return "yi-vl"
+    elif "deepseek-vl" in filename_lower:
+        return "deepseek-vl"
+    
+    # 模糊匹配
+    if "qwen" in filename_lower and "vl" in filename_lower:
+        return "qwen-vl"
+    elif "vision" in filename_lower or "visual" in filename_lower:
+        return "generic-vl"
+    
+    return "unknown"
+
+
+def _detect_model_family_from_path(model_path: Path) -> str:
+    """从模型文件路径更精确地检测模型家族"""
+    if not model_path.exists():
+        return "unknown"
+    
+    filename = model_path.name.lower()
+    family = _detect_model_family_from_filename(filename)
+    
+    if family == "unknown":
+        # 尝试读取文件头信息
+        try:
+            with open(model_path, 'rb') as f:
+                # 读取前512字节
+                header = f.read(512)
+                header_str = header.decode('ascii', errors='ignore')
+                
+                # 在文件头中搜索关键词
+                if 'qwen' in header_str.lower():
+                    if '2.5' in header_str:
+                        return "qwen2.5-vl"
+                    elif '3' in header_str:
+                        return "qwen3-vl"
+                    elif '2' in header_str:
+                        return "qwen2-vl"
+                    else:
+                        return "qwen-vl"
+                elif 'llava' in header_str.lower():
+                    if '1.6' in header_str:
+                        return "llava-1.6"
+                    elif '1.5' in header_str:
+                        return "llava-1.5"
+                    else:
+                        return "llava"
+                elif 'yi' in header_str.lower() and 'vl' in header_str.lower():
+                    return "yi-vl"
+                elif 'deepseek' in header_str.lower() and 'vl' in header_str.lower():
+                    return "deepseek-vl"
+        except:
+            pass
+    
+    return family
+
+
 def _load_gguf_vl_catalog():
     """加载GGUF模型配置"""
     if not GGUF_CONFIG_PATH.exists():
@@ -129,6 +213,7 @@ def _load_gguf_vl_catalog():
         defaults = repo.get("defaults") or {}
         mmproj_file = repo.get("mmproj_file")
         model_files = repo.get("model_files") or []
+        model_family = repo.get("model_family") or "unknown"
 
         for model_file in model_files:
             display = Path(model_file).name
@@ -143,11 +228,16 @@ def _load_gguf_vl_catalog():
                 "alt_repo_ids": alt_repo_ids,
                 "filename": model_file,
                 "mmproj_filename": mmproj_file,
+                "model_family": model_family,
             }
 
     legacy_models = data.get("models") or {}
     for name, entry in legacy_models.items():
         if isinstance(entry, dict):
+            if "model_family" not in entry:
+                # 根据文件名猜测模型家族
+                filename = entry.get("filename", "")
+                entry["model_family"] = _detect_model_family_from_filename(filename)
             flattened[name] = entry
 
     return {"base_dir": base_dir, "models": flattened}
@@ -173,16 +263,39 @@ def _filter_kwargs_for_callable(fn, kwargs: dict) -> dict:
     return {k: v for k, v in kwargs.items() if k in allowed}
 
 
-def _tensor_to_base64_png(tensor) -> str | None:
-    """将张量转换为base64 PNG图像"""
+def _tensor_to_base64_png(tensor, resize_to=(448, 448)) -> str | None:
+    """将张量转换为base64 PNG图像，可调整大小"""
     if tensor is None:
         return None
     if tensor.ndim == 4:
         tensor = tensor[0]
+    
+    # 转换为numpy数组
     array = (tensor * 255).clamp(0, 255).to(torch.uint8).cpu().numpy()
+    
+    # 创建PIL图像
     pil_img = Image.fromarray(array, mode="RGB")
+    
+    # 调整大小（保持宽高比）
+    if resize_to:
+        original_width, original_height = pil_img.size
+        target_width, target_height = resize_to
+        
+        # 计算缩放比例
+        width_ratio = target_width / original_width
+        height_ratio = target_height / original_height
+        ratio = min(width_ratio, height_ratio)
+        
+        new_width = int(original_width * ratio)
+        new_height = int(original_height * ratio)
+        
+        if new_width != original_width or new_height != original_height:
+            pil_img = pil_img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+            print(f"[QwenVL] 图像已调整大小: {original_width}x{original_height} -> {new_width}x{new_height}")
+    
+    # 转换为base64
     buf = io.BytesIO()
-    pil_img.save(buf, format="PNG")
+    pil_img.save(buf, format="PNG", optimize=True)
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 
@@ -270,6 +383,7 @@ def _resolve_model_entry(model_name: str) -> GGUFVLResolved:
 
     model_filename = entry.get("filename")
     mmproj_filename = entry.get("mmproj_filename")
+    model_family = entry.get("model_family") or _detect_model_family_from_filename(model_filename or "")
 
     if not model_filename:
         raise ValueError(f"[QwenVL] gguf_vl_models.json entry missing 'filename' for: {model_name}")
@@ -281,6 +395,28 @@ def _resolve_model_entry(model_name: str) -> GGUFVLResolved:
         except Exception:
             return default
 
+    # 根据模型家族设置默认值
+    if model_family == "qwen2.5-vl":
+        default_ctx = 8192
+        default_img_max = 4096
+        default_n_batch = 512
+        default_gpu_layers = -1
+    elif model_family == "qwen3-vl":
+        default_ctx = 8192
+        default_img_max = 4096
+        default_n_batch = 512
+        default_gpu_layers = -1
+    elif "llava" in model_family:
+        default_ctx = 4096
+        default_img_max = 2048
+        default_n_batch = 256
+        default_gpu_layers = -1
+    else:
+        default_ctx = 8192
+        default_img_max = 4096
+        default_n_batch = 512
+        default_gpu_layers = -1
+
     return GGUFVLResolved(
         display_name=model_name,
         repo_id=repo_id,
@@ -289,12 +425,13 @@ def _resolve_model_entry(model_name: str) -> GGUFVLResolved:
         repo_dirname=_safe_dirname(str(repo_dirname)),
         model_filename=str(model_filename),
         mmproj_filename=str(mmproj_filename) if mmproj_filename else None,
-        context_length=_int("context_length", 8192),
-        image_max_tokens=_int("image_max_tokens", 4096),
-        n_batch=_int("n_batch", 512),
-        gpu_layers=_int("gpu_layers", -1),
+        context_length=_int("context_length", default_ctx),
+        image_max_tokens=_int("image_max_tokens", default_img_max),
+        n_batch=_int("n_batch", default_n_batch),
+        gpu_layers=_int("gpu_layers", default_gpu_layers),
         top_k=_int("top_k", 0),
         pool_size=_int("pool_size", 4194304),
+        model_family=model_family,
     )
 
 
@@ -352,15 +489,36 @@ class QwenVLGGUFBase:
         self.llm = None
         self.chat_handler = None
         self.current_signature = None
+        self.model_family = "unknown"
+        self.handler_name = ""
 
     def clear(self):
         """清理模型资源"""
+        if self.llm is not None:
+            try:
+                # 尝试清理llama.cpp内部资源
+                if hasattr(self.llm, '_ctx'):
+                    self.llm._ctx = None
+                if hasattr(self.llm, '_model'):
+                    self.llm._model = None
+            except:
+                pass
+        
         self.llm = None
         self.chat_handler = None
         self.current_signature = None
+        self.model_family = "unknown"
+        self.handler_name = ""
+        
+        # 强制垃圾回收
         gc.collect()
+        
+        # 清理CUDA缓存
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        
+        print(f"[QwenVL] 模型资源已清理")
 
     def _load_backend(self):
         """加载后端库"""
@@ -371,68 +529,80 @@ class QwenVLGGUFBase:
                 "[QwenVL] llama_cpp is not available. Install the GGUF vision dependency first. See docs/GGUF_MANUAL_INSTALL.md"
             ) from exc
 
-    def _create_chat_handler(self, handler_cls, mmproj_path, img_max):
+    def _create_chat_handler(self, handler_cls, mmproj_path, img_max, model_family):
         """根据处理器类创建相应的处理器实例"""
-        handler_name = handler_cls.__name__
+        self.handler_name = handler_cls.__name__
         
-        # 定义不同处理器类支持的参数
-        param_templates = {
-            "Qwen3VLChatHandler": {
-                "clip_model_path": str(mmproj_path),
-                "image_max_tokens": img_max,
-                "force_reasoning": False,
-                "verbose": False,
-            },
-            "Qwen25VLChatHandler": {
-                "clip_model_path": str(mmproj_path),
-                "image_max_tokens": img_max,
-                "force_reasoning": False,
-                "verbose": False,
-            },
-            "Llava15ChatHandler": {
-                "clip_model_path": str(mmproj_path),
-                "verbose": False,
-                # Llava15ChatHandler 不支持 image_max_tokens
-            },
-            "Llava16ChatHandler": {
-                "clip_model_path": str(mmproj_path),
-                "verbose": False,
-                # Llava16ChatHandler 可能也不支持 image_max_tokens
-            },
-            "LlavaChatHandler": {
-                "clip_model_path": str(mmproj_path),
-                "verbose": False,
-                # 通用 Llava 处理器
-            },
+        # 基础参数
+        base_params = {
+            "clip_model_path": str(mmproj_path),
+            "verbose": False,
         }
         
-        # 检查处理器类实际支持的参数
+        # 根据处理器类型和模型家族添加特定参数
+        if self.handler_name == "Qwen25VLChatHandler":
+            # Qwen2.5-VL处理器支持以下参数
+            possible_params = {
+                "image_max_tokens": img_max,
+                "force_reasoning": False,
+                "image_min_tokens": 1024,
+            }
+        elif self.handler_name == "Qwen3VLChatHandler":
+            # Qwen3-VL处理器参数
+            possible_params = {
+                "image_max_tokens": img_max,
+                "force_reasoning": False,
+                "image_min_tokens": 1024,
+            }
+        elif "Llava" in self.handler_name:
+            # LLaVA处理器参数
+            possible_params = {
+                # LLaVA通常不支持image_max_tokens参数
+            }
+        else:
+            possible_params = {}
+        
+        # 检查处理器实际支持的参数
         try:
             sig = inspect.signature(handler_cls.__init__)
-            supported_params = list(sig.parameters.keys())
+            supported_params = set(sig.parameters.keys())
         except Exception:
-            supported_params = []
+            supported_params = set(base_params.keys())
         
-        # 选择基础参数模板
-        if handler_name in param_templates:
-            kwargs = param_templates[handler_name].copy()
-        else:
-            kwargs = {
-                "clip_model_path": str(mmproj_path),
-                "verbose": False,
-            }
-            print(f"[QwenVL] 警告: {handler_name} 使用默认参数")
+        # 构建最终的参数
+        final_params = {}
         
-        # 过滤掉处理器不支持的参数
-        filtered_kwargs = {}
-        for key, value in kwargs.items():
+        # 添加基础参数
+        for key, value in base_params.items():
             if key in supported_params:
-                filtered_kwargs[key] = value
+                final_params[key] = value
             else:
-                print(f"[QwenVL] 跳过 {handler_name} 不支持参数: {key}")
+                print(f"[QwenVL] 警告: {self.handler_name} 不支持基础参数 {key}")
         
-        print(f"[QwenVL] 使用 {handler_name}，参数: {list(filtered_kwargs.keys())}")
-        return handler_cls(**filtered_kwargs)
+        # 添加可能的高级参数
+        for key, value in possible_params.items():
+            if key in supported_params:
+                final_params[key] = value
+            else:
+                print(f"[QwenVL] 跳过 {self.handler_name} 不支持参数: {key}")
+        
+        print(f"[QwenVL] 使用 {self.handler_name} 处理 {model_family} 模型")
+        print(f"[QwenVL] 参数列表: {list(final_params.keys())}")
+        
+        try:
+            return handler_cls(**final_params)
+        except Exception as e:
+            print(f"[QwenVL] 创建处理器失败: {e}")
+            # 尝试最小参数集
+            try:
+                minimal_params = {"clip_model_path": str(mmproj_path)}
+                if "verbose" in supported_params:
+                    minimal_params["verbose"] = False
+                print(f"[QwenVL] 尝试最小参数集: {list(minimal_params.keys())}")
+                return handler_cls(**minimal_params)
+            except Exception as e2:
+                print(f"[QwenVL] 最小参数集也失败: {e2}")
+                raise
 
     def _load_model(
         self,
@@ -463,7 +633,45 @@ class QwenVLGGUFBase:
                 print(f"[QwenVL] 警告: mmproj文件不存在: {mmproj_path}，将不使用视觉功能")
                 mmproj_path = None
                 
-            # 使用默认配置值
+            # 更精确的模型家族检测
+            self.model_family = _detect_model_family_from_path(model_path)
+            
+            # 检查模型文件大小
+            file_size_mb = model_path.stat().st_size / (1024 * 1024)
+            print(f"[QwenVL] 模型文件大小: {file_size_mb:.1f} MB")
+            
+            # 如果文件名包含特定信息但检测为unknown，尝试进一步检测
+            if self.model_family == "unknown":
+                filename_lower = model_path.name.lower()
+                if "qwen2.5" in filename_lower or "qwen2_5" in filename_lower:
+                    self.model_family = "qwen2.5-vl"
+                    print(f"[QwenVL] 根据文件名推断模型家族为: qwen2.5-vl")
+                elif "qwen3" in filename_lower:
+                    self.model_family = "qwen3-vl"
+                    print(f"[QwenVL] 根据文件名推断模型家族为: qwen3-vl")
+                    
+            # 根据模型家族设置默认参数
+            if self.model_family == "qwen2.5-vl":
+                default_ctx = 8192
+                default_img_max = 4096
+                default_n_batch = 512
+                default_gpu_layers = -1
+            elif self.model_family == "qwen3-vl":
+                default_ctx = 8192
+                default_img_max = 4096
+                default_n_batch = 512
+                default_gpu_layers = -1
+            elif "llava" in self.model_family:
+                default_ctx = 4096
+                default_img_max = 2048
+                default_n_batch = 256
+                default_gpu_layers = -1
+            else:
+                default_ctx = 8192
+                default_img_max = 4096
+                default_n_batch = 512
+                default_gpu_layers = -1
+            
             resolved = GGUFVLResolved(
                 display_name=model_path.name,
                 repo_id=None,
@@ -472,16 +680,18 @@ class QwenVLGGUFBase:
                 repo_dirname=model_path.parent.name,
                 model_filename=model_path.name,
                 mmproj_filename=mmproj_path.name if mmproj_path else None,
-                context_length=8192,
-                image_max_tokens=4096,
-                n_batch=512,
-                gpu_layers=-1,
+                context_length=default_ctx,
+                image_max_tokens=default_img_max,
+                n_batch=default_n_batch,
+                gpu_layers=default_gpu_layers,
                 top_k=0,
                 pool_size=4194304,
+                model_family=self.model_family,
             )
         else:
             # 使用配置中的模型
             resolved = _resolve_model_entry(model_source)
+            self.model_family = resolved.model_family
             base_dir = _resolve_base_dir(GGUF_VL_CATALOG.get("base_dir") or "llm/GGUF")
 
             author_dir = _safe_dirname(resolved.author or "")
@@ -531,8 +741,10 @@ class QwenVLGGUFBase:
             img_max,
             top_k_val,
             pool_size_val,
+            self.model_family,
         )
         if self.llm is not None and self.current_signature == signature:
+            print(f"[QwenVL] 模型已加载，跳过重复加载")
             return
 
         self.clear()
@@ -541,24 +753,51 @@ class QwenVLGGUFBase:
 
         self.chat_handler = None
         if has_mmproj:
-            handler_classes_to_try = [
-                ("Qwen3VLChatHandler", "from llama_cpp.llama_chat_format import Qwen3VLChatHandler"),
-                ("Qwen25VLChatHandler", "from llama_cpp.llama_chat_format import Qwen25VLChatHandler"),
-                ("Llava15ChatHandler", "from llama_cpp.llama_chat_format import Llava15ChatHandler"),
-                ("Llava16ChatHandler", "from llama_cpp.llama_chat_format import Llava16ChatHandler"),
-                ("LlavaChatHandler", "from llama_cpp.llama_chat_format import LlavaChatHandler"),
-            ]
+            # 根据模型家族选择处理器
+            if self.model_family == "qwen2.5-vl":
+                handler_priority = [
+                    ("Qwen25VLChatHandler", "from llama_cpp.llama_chat_format import Qwen25VLChatHandler"),
+                    ("Qwen3VLChatHandler", "from llama_cpp.llama_chat_format import Qwen3VLChatHandler"),
+                    ("LlavaChatHandler", "from llama_cpp.llama_chat_format import LlavaChatHandler"),
+                ]
+            elif self.model_family == "qwen3-vl":
+                handler_priority = [
+                    ("Qwen3VLChatHandler", "from llama_cpp.llama_chat_format import Qwen3VLChatHandler"),
+                    ("Qwen25VLChatHandler", "from llama_cpp.llama_chat_format import Qwen25VLChatHandler"),
+                    ("LlavaChatHandler", "from llama_cpp.llama_chat_format import LlavaChatHandler"),
+                ]
+            elif "llava" in self.model_family:
+                if "1.6" in self.model_family:
+                    handler_priority = [
+                        ("Llava16ChatHandler", "from llama_cpp.llama_chat_format import Llava16ChatHandler"),
+                        ("Llava15ChatHandler", "from llama_cpp.llama_chat_format import Llava15ChatHandler"),
+                        ("LlavaChatHandler", "from llama_cpp.llama_chat_format import LlavaChatHandler"),
+                    ]
+                else:
+                    handler_priority = [
+                        ("Llava15ChatHandler", "from llama_cpp.llama_chat_format import Llava15ChatHandler"),
+                        ("Llava16ChatHandler", "from llama_cpp.llama_chat_format import Llava16ChatHandler"),
+                        ("LlavaChatHandler", "from llama_cpp.llama_chat_format import LlavaChatHandler"),
+                    ]
+            else:
+                # 通用尝试顺序
+                handler_priority = [
+                    ("Qwen25VLChatHandler", "from llama_cpp.llama_chat_format import Qwen25VLChatHandler"),
+                    ("Qwen3VLChatHandler", "from llama_cpp.llama_chat_format import Qwen3VLChatHandler"),
+                    ("Llava15ChatHandler", "from llama_cpp.llama_chat_format import Llava15ChatHandler"),
+                    ("Llava16ChatHandler", "from llama_cpp.llama_chat_format import Llava16ChatHandler"),
+                    ("LlavaChatHandler", "from llama_cpp.llama_chat_format import LlavaChatHandler"),
+                ]
             
             handler_cls = None
             handler_name = ""
             
-            for hname, import_stmt in handler_classes_to_try:
+            for hname, import_stmt in handler_priority:
                 try:
-                    # 动态导入处理器类
                     exec(import_stmt)
                     handler_cls = eval(hname)
                     handler_name = hname
-                    print(f"[QwenVL] 找到处理器: {handler_name}")
+                    print(f"[QwenVL] 为 {self.model_family} 找到处理器: {handler_name}")
                     break
                 except ImportError:
                     continue
@@ -567,9 +806,7 @@ class QwenVLGGUFBase:
                     continue
             
             if handler_cls is None:
-                # 尝试最后的通用方法
                 try:
-                    # 尝试导入通用的处理器
                     from llama_cpp.llama_chat_format import LlavaChatHandler
                     handler_cls = LlavaChatHandler
                     handler_name = "LlavaChatHandler"
@@ -579,10 +816,9 @@ class QwenVLGGUFBase:
                     )
             
             try:
-                self.chat_handler = self._create_chat_handler(handler_cls, mmproj_path, img_max)
+                self.chat_handler = self._create_chat_handler(handler_cls, mmproj_path, img_max, self.model_family)
             except Exception as e:
                 print(f"[QwenVL] 创建 {handler_name} 处理器失败: {e}")
-                # 尝试使用最简单的参数
                 try:
                     print(f"[QwenVL] 尝试使用最小参数集创建处理器")
                     self.chat_handler = handler_cls(clip_model_path=str(mmproj_path), verbose=False)
@@ -597,26 +833,29 @@ class QwenVLGGUFBase:
             "n_ctx": n_ctx,
             "n_gpu_layers": n_gpu_layers,
             "n_batch": n_batch_val,
-            "swa_full": True,
             "verbose": False,
             "pool_size": pool_size_val,
             "top_k": top_k_val,
         }
         
+        # Qwen系列模型需要特定参数
+        if self.model_family in ["qwen2.5-vl", "qwen3-vl"]:
+            llm_kwargs["swa_full"] = True  # Qwen模型需要这个参数
+        
         # 尝试添加 chat_handler
         if has_mmproj and self.chat_handler is not None:
             try:
                 llm_kwargs["chat_handler"] = self.chat_handler
-                llm_kwargs["image_min_tokens"] = 1024
-                # 只有 Qwen 处理器支持 image_max_tokens
-                if handler_name in ["Qwen3VLChatHandler", "Qwen25VLChatHandler"]:
+                if self.model_family in ["qwen2.5-vl", "qwen3-vl"]:
+                    llm_kwargs["image_min_tokens"] = 1024
                     llm_kwargs["image_max_tokens"] = img_max
-                print(f"[QwenVL] 已添加 {handler_name} 作为 chat_handler")
+                print(f"[QwenVL] 已添加 {self.handler_name} 作为 chat_handler")
             except Exception as e:
                 print(f"[QwenVL] 警告: 添加 chat_handler 失败: {e}")
                 print(f"[QwenVL] 图像功能可能受限")
 
-        print(f"[QwenVL] Loading GGUF: {model_path.name} (device={device_kind}, gpu_layers={n_gpu_layers}, ctx={n_ctx})")
+        print(f"[QwenVL] Loading GGUF: {model_path.name} ({self.model_family})")
+        print(f"[QwenVL] Device: {device_kind}, GPU layers: {n_gpu_layers}, Context: {n_ctx}")
         
         # 过滤掉 Llama 不支持的参数
         llm_kwargs_filtered = _filter_kwargs_for_callable(getattr(Llama, "__init__", Llama), llm_kwargs)
@@ -629,9 +868,8 @@ class QwenVLGGUFBase:
                 "请更新到支持多模态的 llama-cpp-python 版本。"
             )
             # 移除 chat_handler 相关参数
-            llm_kwargs_filtered.pop("chat_handler", None)
-            llm_kwargs_filtered.pop("image_min_tokens", None)
-            llm_kwargs_filtered.pop("image_max_tokens", None)
+            for key in ["chat_handler", "image_min_tokens", "image_max_tokens"]:
+                llm_kwargs_filtered.pop(key, None)
             
         if device_kind == "cuda" and n_gpu_layers == 0:
             print("[QwenVL] 警告: device=cuda 但 n_gpu_layers=0，模型将在 CPU 上运行")
@@ -639,7 +877,7 @@ class QwenVLGGUFBase:
         try:
             self.llm = Llama(**llm_kwargs_filtered)
             self.current_signature = signature
-            print(f"[QwenVL] 模型加载成功")
+            print(f"[QwenVL] {self.model_family} 模型加载成功")
         except Exception as e:
             print(f"[QwenVL] 模型加载失败: {e}")
             # 尝试去掉可能的额外参数
@@ -647,7 +885,6 @@ class QwenVLGGUFBase:
                 "model_path": str(model_path),
                 "n_ctx": n_ctx,
                 "n_gpu_layers": n_gpu_layers,
-                "n_batch": n_batch_val,
                 "verbose": False,
             }
             try:
@@ -696,6 +933,13 @@ class QwenVLGGUFBase:
         
         start = time.perf_counter()
         try:
+            # Qwen系列模型的特殊停止词
+            stop_tokens = ["<|im_end|>", "<|im_start|>"]
+            if self.model_family == "qwen2.5-vl":
+                stop_tokens.extend(["<|endoftext|>", "用户:"])
+            elif self.model_family == "qwen3-vl":
+                stop_tokens.extend(["<|endoftext|>", "用户:", "assistant:"])
+            
             result = self.llm.create_chat_completion(
                 messages=messages,
                 max_tokens=int(max_tokens),
@@ -703,7 +947,7 @@ class QwenVLGGUFBase:
                 top_p=float(top_p),
                 repeat_penalty=float(repetition_penalty),
                 seed=int(seed),
-                stop=["<|im_end|>", "<|im_start|>"],
+                stop=stop_tokens,
             )
         except Exception as e:
             print(f"[QwenVL] 生成失败: {e}")
@@ -771,7 +1015,7 @@ class QwenVLGGUFBase:
         if images:
             for i, image_tensor in enumerate(images):
                 if image_tensor is not None:
-                    img = _tensor_to_base64_png(image_tensor)
+                    img = _tensor_to_base64_png(image_tensor, resize_to=(448, 448))
                     if img:
                         images_b64.append(img)
                         print(f"[QwenVL] 图像{i+1}: 已转换")
@@ -779,7 +1023,7 @@ class QwenVLGGUFBase:
         # 处理视频输入（视频通常作为用户输入的一部分）
         if video is not None:
             for frame in _sample_video_frames(video, int(frame_count)):
-                img = _tensor_to_base64_png(frame)
+                img = _tensor_to_base64_png(frame, resize_to=(448, 448))
                 if img:
                     images_b64.append(img)
 
@@ -818,6 +1062,8 @@ class QwenVLGGUFBase:
             return (text,)
         except Exception as e:
             print(f"[QwenVL] 运行失败: {e}")
+            import traceback
+            traceback.print_exc()
             return (f"[错误] {str(e)}",)
         finally:
             if not keep_model_loaded:
@@ -863,7 +1109,7 @@ class AILab_QwenVL_GGUF(QwenVLGGUFBase):
             "required": {
                 # 默认启用本地文件
                 "使用本地文件": ("BOOLEAN", {"default": True, "tooltip": "启用后使用本地GGUF文件，否则使用配置中的模型"}),
-                "模型选择方式": (["从配置选择", "本地文件"], {"default": "本地文件", "tooltip": "选择模型加载方式"}),
+                "模型选择方式": (["从配置选择", "本地文件"], {"default": "从配置选择", "tooltip": "选择模型加载方式"}),
                 "model_name": (model_keys, {"default": default_model, "tooltip": "从配置中选择模型"}),
                 "本地模型文件": (["无"] + [display for _, display in local_gguf_files], {"default": "无", "tooltip": "选择本地GGUF文件"}),
                 "本地mmproj文件": (["无"] + [display for _, display in local_mmproj_files], {"default": "无", "tooltip": "选择本地mmproj文件（视觉模型需要）"}),
@@ -979,7 +1225,9 @@ class AILab_QwenVL_GGUF(QwenVLGGUFBase):
             if model_source == "无":
                 raise ValueError("请选择有效的本地模型文件")
         else:
-            raise ValueError("本节点已配置为默认使用本地文件，请取消勾选'使用本地文件'以使用配置模型")
+            # 使用配置中的模型
+            model_source = model_name
+            mmproj_source = "无"  # 配置模型会自动查找mmproj
         
         print(f"[QwenVL] 多图分析模式: {分析模式}")
         print(f"[QwenVL] 输入 {len(images)} 张图像，将按输入顺序处理")
@@ -1021,6 +1269,7 @@ class AILab_QwenVL_GGUF_Advanced(QwenVLGGUFBase):
         all_models = GGUF_VL_CATALOG.get("models") or {}
         model_keys = sorted([key for key, entry in all_models.items() if (entry or {}).get("mmproj_filename")]) or ["(edit gguf_models.json)"]
         default_model = model_keys[0] if model_keys else ""
+        
         # 获取本地文件
         local_gguf_files = _get_local_gguf_files()
         local_mmproj_files = _get_local_mmproj_files()
@@ -1055,7 +1304,7 @@ class AILab_QwenVL_GGUF_Advanced(QwenVLGGUFBase):
             "required": {
                 # 默认启用本地文件
                 "使用本地文件": ("BOOLEAN", {"default": True, "tooltip": "启用后使用本地GGUF文件，否则使用配置中的模型"}),
-                "模型选择方式": (["从配置选择", "本地文件"], {"default": "本地文件", "tooltip": "选择模型加载方式"}),
+                "模型选择方式": (["从配置选择", "本地文件"], {"default": "从配置选择", "tooltip": "选择模型加载方式"}),
                 "model_name": (model_keys, {"default": default_model, "tooltip": "从配置中选择模型"}),
                 "本地模型文件": (["无"] + [display for _, display in local_gguf_files], {"default": "无", "tooltip": "选择本地GGUF文件"}),
                 "本地mmproj文件": (["无"] + [display for _, display in local_mmproj_files], {"default": "无", "tooltip": "选择本地mmproj文件（视觉模型需要）"}),
@@ -1195,7 +1444,9 @@ class AILab_QwenVL_GGUF_Advanced(QwenVLGGUFBase):
             if model_source == "无":
                 raise ValueError("请选择有效的本地模型文件")
         else:
-            raise ValueError("本节点已配置为默认使用本地文件")
+            # 使用配置中的模型
+            model_source = model_name
+            mmproj_source = "无"
         
         print(f"[QwenVL] 高级分析模式: {分析模式}")
         print(f"[QwenVL] 输入 {len(images)} 张图像")
@@ -1229,9 +1480,7 @@ class AILab_QwenVL_GGUF_Advanced(QwenVLGGUFBase):
         )
 
 
-# 添加必要的import
-import random
-
+# 节点注册
 NODE_CLASS_MAPPINGS = {
     "AILab_QwenVL_GGUF": AILab_QwenVL_GGUF,
     "AILab_QwenVL_GGUF_Advanced": AILab_QwenVL_GGUF_Advanced,
