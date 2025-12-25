@@ -1,4 +1,4 @@
-# ComfyUI-QwenVL (GGUF) - 支持多图输入和本地文件选择
+# ComfyUI-QwenVL (GGUF) - 优化版：默认启用本地文件，支持多图分析
 
 import base64
 import gc
@@ -371,9 +371,72 @@ class QwenVLGGUFBase:
                 "[QwenVL] llama_cpp is not available. Install the GGUF vision dependency first. See docs/GGUF_MANUAL_INSTALL.md"
             ) from exc
 
+    def _create_chat_handler(self, handler_cls, mmproj_path, img_max):
+        """根据处理器类创建相应的处理器实例"""
+        handler_name = handler_cls.__name__
+        
+        # 定义不同处理器类支持的参数
+        param_templates = {
+            "Qwen3VLChatHandler": {
+                "clip_model_path": str(mmproj_path),
+                "image_max_tokens": img_max,
+                "force_reasoning": False,
+                "verbose": False,
+            },
+            "Qwen25VLChatHandler": {
+                "clip_model_path": str(mmproj_path),
+                "image_max_tokens": img_max,
+                "force_reasoning": False,
+                "verbose": False,
+            },
+            "Llava15ChatHandler": {
+                "clip_model_path": str(mmproj_path),
+                "verbose": False,
+                # Llava15ChatHandler 不支持 image_max_tokens
+            },
+            "Llava16ChatHandler": {
+                "clip_model_path": str(mmproj_path),
+                "verbose": False,
+                # Llava16ChatHandler 可能也不支持 image_max_tokens
+            },
+            "LlavaChatHandler": {
+                "clip_model_path": str(mmproj_path),
+                "verbose": False,
+                # 通用 Llava 处理器
+            },
+        }
+        
+        # 检查处理器类实际支持的参数
+        try:
+            sig = inspect.signature(handler_cls.__init__)
+            supported_params = list(sig.parameters.keys())
+        except Exception:
+            supported_params = []
+        
+        # 选择基础参数模板
+        if handler_name in param_templates:
+            kwargs = param_templates[handler_name].copy()
+        else:
+            kwargs = {
+                "clip_model_path": str(mmproj_path),
+                "verbose": False,
+            }
+            print(f"[QwenVL] 警告: {handler_name} 使用默认参数")
+        
+        # 过滤掉处理器不支持的参数
+        filtered_kwargs = {}
+        for key, value in kwargs.items():
+            if key in supported_params:
+                filtered_kwargs[key] = value
+            else:
+                print(f"[QwenVL] 跳过 {handler_name} 不支持参数: {key}")
+        
+        print(f"[QwenVL] 使用 {handler_name}，参数: {list(filtered_kwargs.keys())}")
+        return handler_cls(**filtered_kwargs)
+
     def _load_model(
         self,
-        model_source: str,  # 改为模型来源：可以是配置名称或本地路径
+        model_source: str,  # 模型来源：配置名称或本地路径
         mmproj_source: str,  # mmproj文件来源
         device: str,
         ctx: int | None,
@@ -478,34 +541,56 @@ class QwenVLGGUFBase:
 
         self.chat_handler = None
         if has_mmproj:
+            handler_classes_to_try = [
+                ("Qwen3VLChatHandler", "from llama_cpp.llama_chat_format import Qwen3VLChatHandler"),
+                ("Qwen25VLChatHandler", "from llama_cpp.llama_chat_format import Qwen25VLChatHandler"),
+                ("Llava15ChatHandler", "from llama_cpp.llama_chat_format import Llava15ChatHandler"),
+                ("Llava16ChatHandler", "from llama_cpp.llama_chat_format import Llava16ChatHandler"),
+                ("LlavaChatHandler", "from llama_cpp.llama_chat_format import LlavaChatHandler"),
+            ]
+            
             handler_cls = None
-            try:
-                from llama_cpp.llama_chat_format import Qwen3VLChatHandler
-
-                handler_cls = Qwen3VLChatHandler
-            except ImportError:
+            handler_name = ""
+            
+            for hname, import_stmt in handler_classes_to_try:
                 try:
-                    from llama_cpp.llama_chat_format import Qwen25VLChatHandler
-
-                    handler_cls = Qwen25VLChatHandler
+                    # 动态导入处理器类
+                    exec(import_stmt)
+                    handler_cls = eval(hname)
+                    handler_name = hname
+                    print(f"[QwenVL] 找到处理器: {handler_name}")
+                    break
+                except ImportError:
+                    continue
+                except Exception as e:
+                    print(f"[QwenVL] 导入 {hname} 失败: {e}")
+                    continue
+            
+            if handler_cls is None:
+                # 尝试最后的通用方法
+                try:
+                    # 尝试导入通用的处理器
+                    from llama_cpp.llama_chat_format import LlavaChatHandler
+                    handler_cls = LlavaChatHandler
+                    handler_name = "LlavaChatHandler"
                 except ImportError:
                     raise RuntimeError(
-                        "[QwenVL] Missing Qwen VL chat handler in llama_cpp. Install the correct fork/wheel. See docs/GGUF_MANUAL_INSTALL.md"
+                        "[QwenVL] Missing vision chat handler in llama_cpp. Install the correct fork/wheel. See docs/GGUF_MANUAL_INSTALL.md"
                     )
-
-            mmproj_kwargs = {
-                "clip_model_path": str(mmproj_path),
-                "image_max_tokens": img_max,
-                "force_reasoning": False,
-                "verbose": False,
-            }
-            mmproj_kwargs = _filter_kwargs_for_callable(getattr(handler_cls, "__init__", handler_cls), mmproj_kwargs)
-            if "image_max_tokens" not in mmproj_kwargs:
-                print(
-                    "[QwenVL] Warning: installed llama_cpp chat handler does not support image_max_tokens; "
-                    "image token budget will be controlled by ctx only."
-                )
-            self.chat_handler = handler_cls(**mmproj_kwargs)
+            
+            try:
+                self.chat_handler = self._create_chat_handler(handler_cls, mmproj_path, img_max)
+            except Exception as e:
+                print(f"[QwenVL] 创建 {handler_name} 处理器失败: {e}")
+                # 尝试使用最简单的参数
+                try:
+                    print(f"[QwenVL] 尝试使用最小参数集创建处理器")
+                    self.chat_handler = handler_cls(clip_model_path=str(mmproj_path), verbose=False)
+                except Exception as e2:
+                    print(f"[QwenVL] 最小参数也失败: {e2}")
+                    print(f"[QwenVL] 警告: 无法创建视觉处理器，图像功能将不可用")
+                    self.chat_handler = None
+                    has_mmproj = False
 
         llm_kwargs = {
             "model_path": str(model_path),
@@ -517,61 +602,124 @@ class QwenVLGGUFBase:
             "pool_size": pool_size_val,
             "top_k": top_k_val,
         }
+        
+        # 尝试添加 chat_handler
         if has_mmproj and self.chat_handler is not None:
-            llm_kwargs["chat_handler"] = self.chat_handler
-            llm_kwargs["image_min_tokens"] = 1024
-            llm_kwargs["image_max_tokens"] = img_max
+            try:
+                llm_kwargs["chat_handler"] = self.chat_handler
+                llm_kwargs["image_min_tokens"] = 1024
+                # 只有 Qwen 处理器支持 image_max_tokens
+                if handler_name in ["Qwen3VLChatHandler", "Qwen25VLChatHandler"]:
+                    llm_kwargs["image_max_tokens"] = img_max
+                print(f"[QwenVL] 已添加 {handler_name} 作为 chat_handler")
+            except Exception as e:
+                print(f"[QwenVL] 警告: 添加 chat_handler 失败: {e}")
+                print(f"[QwenVL] 图像功能可能受限")
 
         print(f"[QwenVL] Loading GGUF: {model_path.name} (device={device_kind}, gpu_layers={n_gpu_layers}, ctx={n_ctx})")
+        
+        # 过滤掉 Llama 不支持的参数
         llm_kwargs_filtered = _filter_kwargs_for_callable(getattr(Llama, "__init__", Llama), llm_kwargs)
+        
+        # 检查 chat_handler 是否被接受
         if has_mmproj and self.chat_handler is not None and "chat_handler" not in llm_kwargs_filtered:
             print(
-                "[QwenVL] Warning: installed llama_cpp Llama() does not accept chat_handler; images will be ignored. "
-                "Update llama-cpp-python to a multimodal-capable build."
+                "[QwenVL] 警告: 当前 llama_cpp 版本不支持 chat_handler 参数。"
+                "这可能是因为您使用的是旧版本或不支持多模态的构建。"
+                "请更新到支持多模态的 llama-cpp-python 版本。"
             )
+            # 移除 chat_handler 相关参数
+            llm_kwargs_filtered.pop("chat_handler", None)
+            llm_kwargs_filtered.pop("image_min_tokens", None)
+            llm_kwargs_filtered.pop("image_max_tokens", None)
+            
         if device_kind == "cuda" and n_gpu_layers == 0:
-            print("[QwenVL] Warning: device=cuda selected but n_gpu_layers=0; model will run on CPU.")
-        self.llm = Llama(**llm_kwargs_filtered)
-        self.current_signature = signature
+            print("[QwenVL] 警告: device=cuda 但 n_gpu_layers=0，模型将在 CPU 上运行")
+            
+        try:
+            self.llm = Llama(**llm_kwargs_filtered)
+            self.current_signature = signature
+            print(f"[QwenVL] 模型加载成功")
+        except Exception as e:
+            print(f"[QwenVL] 模型加载失败: {e}")
+            # 尝试去掉可能的额外参数
+            minimal_kwargs = {
+                "model_path": str(model_path),
+                "n_ctx": n_ctx,
+                "n_gpu_layers": n_gpu_layers,
+                "n_batch": n_batch_val,
+                "verbose": False,
+            }
+            try:
+                self.llm = Llama(**minimal_kwargs)
+                self.current_signature = signature
+                print(f"[QwenVL] 使用最小参数集加载模型成功")
+            except Exception as e2:
+                raise RuntimeError(f"[QwenVL] 模型加载失败，请检查模型文件: {e2}")
 
     def _invoke(
         self,
         system_prompt: str,
         user_prompt: str,
-        images_b64: list[str],
+        images_b64: list[str],  # 所有图像，按输入顺序
         max_tokens: int,
         temperature: float,
         top_p: float,
         repetition_penalty: float,
         seed: int,
     ) -> str:
-        """调用模型生成"""
-        if images_b64:
-            content = [{"type": "text", "text": user_prompt}]
-            for img in images_b64:
-                if not img:
-                    continue
-                content.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img}"}})
-            messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": content},
-            ]
-        else:
-            messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ]
-
+        """调用模型生成 - 支持按顺序处理图像"""
+        
+        # 构建消息，图像按输入顺序附加到用户消息
+        messages = []
+        
+        # 添加系统消息（仅文本）
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        
+        # 添加用户消息（包含用户文本和所有图像）
+        user_content = []
+        
+        # 添加用户文本提示
+        if user_prompt:
+            user_content.append({"type": "text", "text": user_prompt})
+        
+        # 按输入顺序添加所有图像
+        for i, img in enumerate(images_b64):
+            if img:
+                user_content.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img}"}})
+        
+        if user_content:
+            messages.append({"role": "user", "content": user_content})
+        
+        print(f"[QwenVL] 总共输入 {len(images_b64)} 张图像，将按输入顺序处理")
+        
         start = time.perf_counter()
-        result = self.llm.create_chat_completion(
-            messages=messages,
-            max_tokens=int(max_tokens),
-            temperature=float(temperature),
-            top_p=float(top_p),
-            repeat_penalty=float(repetition_penalty),
-            seed=int(seed),
-            stop=["<|im_end|>", "<|im_start|>"],
-        )
+        try:
+            result = self.llm.create_chat_completion(
+                messages=messages,
+                max_tokens=int(max_tokens),
+                temperature=float(temperature),
+                top_p=float(top_p),
+                repeat_penalty=float(repetition_penalty),
+                seed=int(seed),
+                stop=["<|im_end|>", "<|im_start|>"],
+            )
+        except Exception as e:
+            print(f"[QwenVL] 生成失败: {e}")
+            # 尝试简化调用
+            try:
+                print(f"[QwenVL] 尝试简化生成调用")
+                result = self.llm.create_chat_completion(
+                    messages=messages,
+                    max_tokens=int(max_tokens),
+                    temperature=float(temperature),
+                    top_p=float(top_p),
+                )
+            except Exception as e2:
+                print(f"[QwenVL] 简化调用也失败: {e2}")
+                return f"[错误] 生成失败: {e2}"
+                
         elapsed = max(time.perf_counter() - start, 1e-6)
 
         usage = result.get("usage") or {}
@@ -596,9 +744,9 @@ class QwenVLGGUFBase:
         model_source: str,  # 模型来源：配置名称或本地路径
         mmproj_source: str,  # mmproj文件来源
         use_local_files: bool,  # 是否使用本地文件
-        preset_prompt: str,
-        custom_prompt: str,
-        images: list,  # 图像列表
+        system_prompt: str,    # 系统角色定义提示词
+        user_prompt: str,      # 用户输入提示词
+        images: list,          # 所有图像列表，按输入顺序
         video,
         frame_count: int,
         max_tokens: int,
@@ -618,21 +766,17 @@ class QwenVLGGUFBase:
         """运行模型生成"""
         torch.manual_seed(int(seed))
 
-        prompt = SYSTEM_PROMPTS.get(preset_prompt, preset_prompt)
-        if custom_prompt and custom_prompt.strip():
-            prompt = custom_prompt.strip()
-
+        # 处理所有图像，按输入顺序
         images_b64: list[str] = []
-        
-        # 处理多个图像输入
         if images:
-            for image_tensor in images:
+            for i, image_tensor in enumerate(images):
                 if image_tensor is not None:
                     img = _tensor_to_base64_png(image_tensor)
                     if img:
                         images_b64.append(img)
-                        
-        # 处理视频输入
+                        print(f"[QwenVL] 图像{i+1}: 已转换")
+        
+        # 处理视频输入（视频通常作为用户输入的一部分）
         if video is not None:
             for frame in _sample_video_frames(video, int(frame_count)):
                 img = _tensor_to_base64_png(frame)
@@ -652,19 +796,18 @@ class QwenVLGGUFBase:
                 pool_size=pool_size,
                 is_local_file=use_local_files,
             )
-            if images_b64 and self.chat_handler is None:
-                print("[QwenVL] Warning: images provided but this model entry has no mmproj_file; images will be ignored")
+            
+            total_images = len(images_b64)
+            if total_images > 0 and self.chat_handler is None:
+                print("[QwenVL] 警告: 提供了图像但模型没有视觉处理器，图像将被忽略")
             
             # 打印图像信息
-            if images_b64:
-                print(f"[QwenVL] 输入 {len(images_b64)} 张图像")
+            if self.chat_handler is not None and total_images > 0:
+                print(f"[QwenVL] 总共输入 {total_images} 张图像，将按输入顺序处理")
             
             text = self._invoke(
-                system_prompt=(
-                    "You are a helpful vision-language assistant. "
-                    "Answer directly with the final answer only. No <think> and no reasoning."
-                ),
-                user_prompt=prompt,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
                 images_b64=images_b64 if self.chat_handler is not None else [],
                 max_tokens=max_tokens,
                 temperature=temperature,
@@ -673,13 +816,16 @@ class QwenVLGGUFBase:
                 seed=seed,
             )
             return (text,)
+        except Exception as e:
+            print(f"[QwenVL] 运行失败: {e}")
+            return (f"[错误] {str(e)}",)
         finally:
             if not keep_model_loaded:
                 self.clear()
 
 
 class AILab_QwenVL_GGUF(QwenVLGGUFBase):
-    """基础版GGUF节点 - 支持多图输入和本地文件选择"""
+    """基础版GGUF节点 - 默认使用本地文件，支持多图分析"""
     
     @classmethod
     def INPUT_TYPES(cls):
@@ -691,68 +837,128 @@ class AILab_QwenVL_GGUF(QwenVLGGUFBase):
         local_gguf_files = _get_local_gguf_files()
         local_mmproj_files = _get_local_mmproj_files()
         
-        prompts = PRESET_PROMPTS or ["🖼️ Detailed Description"]
-        preferred_prompt = "🖼️ Detailed Description"
-        default_prompt = preferred_prompt if preferred_prompt in prompts else prompts[0]
+        # 设置默认值
+        default_model_file = "无"
+        default_mmproj_file = "无"
+        
+        if local_gguf_files:
+            default_model_file = local_gguf_files[0][1]  # 第一个本地文件
+        
+        if len(local_mmproj_files) > 1:
+            default_mmproj_file = local_mmproj_files[1][1]  # 跳过第一个"无"选项
+        
+        # 多图分析专用提示词
+        multi_image_prompts = [
+            "详细描述这张图片",
+            "分析图片的艺术风格",
+            "描述图片中的人物和场景",
+            "提取图片的关键信息",
+            "为图片创作一个故事",
+            "分析图片的色彩和构图",
+            "描述图片中的物体和关系",
+            "为图片生成详细的描述"
+        ]
 
         return {
             "required": {
-                "使用本地文件": ("BOOLEAN", {"default": False, "tooltip": "启用后使用本地GGUF文件，否则使用配置中的模型"}),
-                "模型选择方式": (["从配置选择", "本地文件"], {"default": "从配置选择", "tooltip": "选择模型加载方式"}),
+                # 默认启用本地文件
+                "使用本地文件": ("BOOLEAN", {"default": True, "tooltip": "启用后使用本地GGUF文件，否则使用配置中的模型"}),
+                "模型选择方式": (["从配置选择", "本地文件"], {"default": "本地文件", "tooltip": "选择模型加载方式"}),
                 "model_name": (model_keys, {"default": default_model, "tooltip": "从配置中选择模型"}),
                 "本地模型文件": (["无"] + [display for _, display in local_gguf_files], {"default": "无", "tooltip": "选择本地GGUF文件"}),
                 "本地mmproj文件": (["无"] + [display for _, display in local_mmproj_files], {"default": "无", "tooltip": "选择本地mmproj文件（视觉模型需要）"}),
-                "preset_prompt": (prompts, {"default": default_prompt}),
-                "custom_prompt": ("STRING", {"default": "", "multiline": True}),
-                "max_tokens": ("INT", {"default": 512, "min": 64, "max": 2048}),
-                "keep_model_loaded": ("BOOLEAN", {"default": True}),
-                "seed": ("INT", {"default": 1, "min": 1, "max": 2**32 - 1}),
+                
+                # 提示词配置
+                "分析模式": (["单图描述", "多图对比", "多图分析"], {"default": "单图描述", "tooltip": "选择分析模式"}),
+                "预设提示词": (multi_image_prompts, {"default": multi_image_prompts[0], "tooltip": "选择预设的多图分析提示词"}),
+                "自定义提示词": ("STRING", {"default": "", "multiline": True, "placeholder": "输入自定义分析提示词（可选）"}),
+                "系统角色定义": ("STRING", {"default": "你是一个专业的视觉分析助手，擅长理解和描述图像内容。", "multiline": True, "placeholder": "定义AI的系统角色"}),
+                
+                # 基本参数
+                "max_tokens": ("INT", {"default": 1024, "min": 256, "max": 4096, "tooltip": "最大生成令牌数"}),
+                "temperature": ("FLOAT", {"default": 0.7, "min": 0.1, "max": 1.5, "step": 0.1, "tooltip": "温度参数，控制随机性"}),
+                "keep_model_loaded": ("BOOLEAN", {"default": True, "tooltip": "保持模型加载以加速后续推理"}),
+                "seed": ("INT", {"default": -1, "min": -1, "max": 2**32 - 1, "tooltip": "随机种子，-1为随机"}),
             },
             "optional": {
-                # 支持最多4张图像输入
-                "image_1": ("IMAGE",),
-                "image_2": ("IMAGE",),
-                "image_3": ("IMAGE",),
-                "image_4": ("IMAGE",),
-                "video": ("IMAGE",),
+                # 图像输入（支持多图）
+                "图像_1": ("IMAGE", {"tooltip": "图像输入 1"}),
+                "图像_2": ("IMAGE", {"tooltip": "图像输入 2"}),
+                "图像_3": ("IMAGE", {"tooltip": "图像输入 3"}),
+                "图像_4": ("IMAGE", {"tooltip": "图像输入 4"}),
+                "图像_5": ("IMAGE", {"tooltip": "图像输入 5"}),
+                "图像_6": ("IMAGE", {"tooltip": "图像输入 6"}),
+                
+                "video": ("IMAGE", {"tooltip": "视频输入（可选）"}),
             },
         }
 
     RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("RESPONSE",)
+    RETURN_NAMES = ("分析结果",)
     FUNCTION = "process"
     CATEGORY = "🧪AILab/QwenVL"
 
     def process(
         self,
-        使用本地文件,
-        模型选择方式,
-        model_name,
-        本地模型文件,
-        本地mmproj文件,
-        preset_prompt,
-        custom_prompt,
-        max_tokens,
-        keep_model_loaded,
-        seed,
-        image_1=None,
-        image_2=None,
-        image_3=None,
-        image_4=None,
+        使用本地文件=True,
+        模型选择方式="本地文件",
+        model_name="无",
+        本地模型文件="无",
+        本地mmproj文件="无",
+        分析模式="单图描述",
+        预设提示词="详细描述这张图片",
+        自定义提示词="",
+        系统角色定义="你是一个专业的视觉分析助手，擅长理解和描述图像内容。",
+        max_tokens=1024,
+        temperature=0.7,
+        keep_model_loaded=True,
+        seed=-1,
+        图像_1=None,
+        图像_2=None,
+        图像_3=None,
+        图像_4=None,
+        图像_5=None,
+        图像_6=None,
         video=None,
     ):
-        # 收集所有图像输入
-        images = [image_1, image_2, image_3, image_4]
-        images = [img for img in images if img is not None]  # 过滤掉None值
+        # 收集所有图像，按输入顺序
+        images = [图像_1, 图像_2, 图像_3, 图像_4, 图像_5, 图像_6]
+        images = [img for img in images if img is not None]
         
-        # 确定模型加载方式
-        use_local = 使用本地文件 or (模型选择方式 == "本地文件")
+        # 根据分析模式调整提示词
+        if 分析模式 == "多图对比":
+            if not 自定义提示词.strip():
+                base_prompt = "请比较和分析这些图片的相似之处和差异："
+            else:
+                base_prompt = 自定义提示词.strip()
+        elif 分析模式 == "多图分析":
+            if not 自定义提示词.strip():
+                base_prompt = "请综合分析这些图片，描述它们共同的主题和各自的特点："
+            else:
+                base_prompt = 自定义提示词.strip()
+        else:  # 单图描述
+            if not 自定义提示词.strip():
+                base_prompt = 预设提示词
+            else:
+                base_prompt = 自定义提示词.strip()
+        
+        # 如果有多个图像，自动调整提示词
+        if len(images) > 1 and 分析模式 == "单图描述":
+            base_prompt = f"请按顺序描述这{len(images)}张图片：{base_prompt}"
+        
+        # 根据图像数量调整系统角色
+        if len(images) > 1:
+            if "多图" not in 系统角色定义:
+                系统角色定义 = f"{系统角色定义}你特别擅长多图分析和对比。"
+        
+        # 使用本地文件（默认启用）
+        use_local = 使用本地文件  # 默认就是True
         
         # 获取实际文件路径
+        model_source = "无"
+        mmproj_source = "无"
+        
         if use_local:
-            model_source = "无"
-            mmproj_source = "无"
-            
             # 查找模型文件路径
             local_gguf_files = _get_local_gguf_files()
             for file_path, display_name in local_gguf_files:
@@ -771,25 +977,31 @@ class AILab_QwenVL_GGUF(QwenVLGGUFBase):
                 mmproj_source = "无"
                 
             if model_source == "无":
-                raise ValueError("未选择有效的本地模型文件")
+                raise ValueError("请选择有效的本地模型文件")
         else:
-            model_source = model_name
-            mmproj_source = "无"  # 配置中的模型会自动处理mmproj
+            raise ValueError("本节点已配置为默认使用本地文件，请取消勾选'使用本地文件'以使用配置模型")
+        
+        print(f"[QwenVL] 多图分析模式: {分析模式}")
+        print(f"[QwenVL] 输入 {len(images)} 张图像，将按输入顺序处理")
+        print(f"[QwenVL] 使用本地模型: {Path(model_source).name}")
+        
+        # 如果种子为-1，使用随机种子
+        effective_seed = seed if seed != -1 else random.randint(1, 2**32 - 1)
         
         return self.run(
             model_source=model_source,
             mmproj_source=mmproj_source,
             use_local_files=use_local,
-            preset_prompt=preset_prompt,
-            custom_prompt=custom_prompt,
+            system_prompt=系统角色定义,
+            user_prompt=base_prompt,
             images=images,
             video=video,
-            frame_count=16,
+            frame_count=8,
             max_tokens=max_tokens,
-            temperature=0.6,
+            temperature=temperature,
             top_p=0.9,
-            repetition_penalty=1.2,
-            seed=seed,
+            repetition_penalty=1.1,
+            seed=effective_seed,
             keep_model_loaded=keep_model_loaded,
             device="auto",
             ctx=None,
@@ -802,110 +1014,167 @@ class AILab_QwenVL_GGUF(QwenVLGGUFBase):
 
 
 class AILab_QwenVL_GGUF_Advanced(QwenVLGGUFBase):
-    """高级版GGUF节点 - 支持多图输入和本地文件选择"""
+    """高级版GGUF节点 - 默认使用本地文件，支持高级多图分析"""
     
     @classmethod
     def INPUT_TYPES(cls):
         all_models = GGUF_VL_CATALOG.get("models") or {}
         model_keys = sorted([key for key, entry in all_models.items() if (entry or {}).get("mmproj_filename")]) or ["(edit gguf_models.json)"]
         default_model = model_keys[0] if model_keys else ""
-
         # 获取本地文件
         local_gguf_files = _get_local_gguf_files()
         local_mmproj_files = _get_local_mmproj_files()
         
-        prompts = PRESET_PROMPTS or ["🖼️ Detailed Description"]
-        preferred_prompt = "🖼️ Detailed Description"
-        default_prompt = preferred_prompt if preferred_prompt in prompts else prompts[0]
-
+        # 设置默认值
+        default_model_file = "无"
+        default_mmproj_file = "无"
+        
+        if local_gguf_files:
+            default_model_file = local_gguf_files[0][1]
+        
+        if len(local_mmproj_files) > 1:
+            default_mmproj_file = local_mmproj_files[1][1]
+        
         num_gpus = torch.cuda.device_count()
         gpu_list = [f"cuda:{i}" for i in range(num_gpus)]
         device_options = ["auto", "cpu", "mps"] + gpu_list
+        
+        # 高级分析模式
+        advanced_modes = [
+            "单图详细描述",
+            "多图对比分析", 
+            "多图故事创作",
+            "多图主题提取",
+            "艺术风格分析",
+            "技术细节分析",
+            "情感氛围分析",
+            "创意灵感生成"
+        ]
 
         return {
             "required": {
-                "使用本地文件": ("BOOLEAN", {"default": False, "tooltip": "启用后使用本地GGUF文件，否则使用配置中的模型"}),
-                "模型选择方式": (["从配置选择", "本地文件"], {"default": "从配置选择", "tooltip": "选择模型加载方式"}),
+                # 默认启用本地文件
+                "使用本地文件": ("BOOLEAN", {"default": True, "tooltip": "启用后使用本地GGUF文件，否则使用配置中的模型"}),
+                "模型选择方式": (["从配置选择", "本地文件"], {"default": "本地文件", "tooltip": "选择模型加载方式"}),
                 "model_name": (model_keys, {"default": default_model, "tooltip": "从配置中选择模型"}),
                 "本地模型文件": (["无"] + [display for _, display in local_gguf_files], {"default": "无", "tooltip": "选择本地GGUF文件"}),
                 "本地mmproj文件": (["无"] + [display for _, display in local_mmproj_files], {"default": "无", "tooltip": "选择本地mmproj文件（视觉模型需要）"}),
-                "device": (device_options, {"default": "auto"}),
-                "preset_prompt": (prompts, {"default": default_prompt}),
-                "custom_prompt": ("STRING", {"default": "", "multiline": True}),
-                "max_tokens": ("INT", {"default": 512, "min": 64, "max": 4096}),
-                "temperature": ("FLOAT", {"default": 0.6, "min": 0.0, "max": 2.0}),
-                "top_p": ("FLOAT", {"default": 0.9, "min": 0.0, "max": 1.0}),
-                "repetition_penalty": ("FLOAT", {"default": 1.2, "min": 0.5, "max": 2.0}),
-                "frame_count": ("INT", {"default": 16, "min": 1, "max": 64}),
-                "ctx": ("INT", {"default": 8192, "min": 1024, "max": 262144, "step": 512}),
-                "n_batch": ("INT", {"default": 512, "min": 64, "max": 32768, "step": 64}),
-                "gpu_layers": ("INT", {"default": -1, "min": -1, "max": 200}),
-                "image_max_tokens": ("INT", {"default": 4096, "min": 256, "max": 1024000, "step": 256}),
-                "top_k": ("INT", {"default": 0, "min": 0, "max": 32768}),
-                "pool_size": ("INT", {"default": 4194304, "min": 1048576, "max": 10485760, "step": 524288}),
-                "keep_model_loaded": ("BOOLEAN", {"default": True}),
-                "seed": ("INT", {"default": 1, "min": 1, "max": 2**32 - 1}),
+                
+                # 高级分析配置
+                "分析模式": (advanced_modes, {"default": advanced_modes[0], "tooltip": "选择高级分析模式"}),
+                "自定义提示词": ("STRING", {"default": "", "multiline": True, "placeholder": "输入自定义分析提示词（可选）"}),
+                "系统角色定义": ("STRING", {"default": "你是一个专业的视觉智能助手，具有深厚的艺术和技术分析能力。", "multiline": True, "placeholder": "定义AI的系统角色"}),
+                
+                # 高级参数
+                "device": (device_options, {"default": "auto", "tooltip": "选择计算设备"}),
+                "max_tokens": ("INT", {"default": 2048, "min": 512, "max": 8192, "tooltip": "最大生成令牌数"}),
+                "temperature": ("FLOAT", {"default": 0.8, "min": 0.1, "max": 1.5, "step": 0.1, "tooltip": "温度参数，控制随机性"}),
+                "top_p": ("FLOAT", {"default": 0.95, "min": 0.5, "max": 1.0, "step": 0.01, "tooltip": "核采样参数"}),
+                "repetition_penalty": ("FLOAT", {"default": 1.1, "min": 1.0, "max": 2.0, "step": 0.1, "tooltip": "重复惩罚参数"}),
+                "ctx": ("INT", {"default": 8192, "min": 2048, "max": 32768, "step": 1024, "tooltip": "上下文长度"}),
+                "gpu_layers": ("INT", {"default": -1, "min": -1, "max": 100, "tooltip": "GPU层数，-1为自动"}),
+                "keep_model_loaded": ("BOOLEAN", {"default": True, "tooltip": "保持模型加载以加速后续推理"}),
+                "seed": ("INT", {"default": -1, "min": -1, "max": 2**32 - 1, "tooltip": "随机种子，-1为随机"}),
             },
             "optional": {
-                # 支持最多6张图像输入
-                "image_1": ("IMAGE",),
-                "image_2": ("IMAGE",),
-                "image_3": ("IMAGE",),
-                "image_4": ("IMAGE",),
-                "image_5": ("IMAGE",),
-                "image_6": ("IMAGE",),
-                "video": ("IMAGE",),
+                # 支持更多图像输入
+                "图像_1": ("IMAGE", {"tooltip": "图像输入 1"}),
+                "图像_2": ("IMAGE", {"tooltip": "图像输入 2"}),
+                "图像_3": ("IMAGE", {"tooltip": "图像输入 3"}),
+                "图像_4": ("IMAGE", {"tooltip": "图像输入 4"}),
+                "图像_5": ("IMAGE", {"tooltip": "图像输入 5"}),
+                "图像_6": ("IMAGE", {"tooltip": "图像输入 6"}),
+                "图像_7": ("IMAGE", {"tooltip": "图像输入 7"}),
+                "图像_8": ("IMAGE", {"tooltip": "图像输入 8"}),
+                "图像_9": ("IMAGE", {"tooltip": "图像输入 9"}),
+                "图像_10": ("IMAGE", {"tooltip": "图像输入 10"}),
+                
+                "video": ("IMAGE", {"tooltip": "视频输入（可选）"}),
             },
         }
 
     RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("RESPONSE",)
+    RETURN_NAMES = ("高级分析结果",)
     FUNCTION = "process"
     CATEGORY = "🧪AILab/QwenVL"
 
     def process(
         self,
-        使用本地文件,
-        模型选择方式,
-        model_name,
-        本地模型文件,
-        本地mmproj文件,
-        device,
-        preset_prompt,
-        custom_prompt,
-        max_tokens,
-        temperature,
-        top_p,
-        repetition_penalty,
-        frame_count,
-        ctx,
-        n_batch,
-        gpu_layers,
-        image_max_tokens,
-        top_k,
-        pool_size,
-        keep_model_loaded,
-        seed,
-        image_1=None,
-        image_2=None,
-        image_3=None,
-        image_4=None,
-        image_5=None,
-        image_6=None,
+        使用本地文件=True,
+        模型选择方式="本地文件",
+        model_name="无",
+        本地模型文件="无",
+        本地mmproj文件="无",
+        分析模式="单图详细描述",
+        自定义提示词="",
+        系统角色定义="你是一个专业的视觉智能助手，具有深厚的艺术和技术分析能力。",
+        device="auto",
+        max_tokens=2048,
+        temperature=0.8,
+        top_p=0.95,
+        repetition_penalty=1.1,
+        ctx=8192,
+        gpu_layers=-1,
+        keep_model_loaded=True,
+        seed=-1,
+        图像_1=None,
+        图像_2=None,
+        图像_3=None,
+        图像_4=None,
+        图像_5=None,
+        图像_6=None,
+        图像_7=None,
+        图像_8=None,
+        图像_9=None,
+        图像_10=None,
         video=None,
     ):
-        # 收集所有图像输入
-        images = [image_1, image_2, image_3, image_4, image_5, image_6]
-        images = [img for img in images if img is not None]  # 过滤掉None值
+        # 收集所有图像，按输入顺序
+        images = [图像_1, 图像_2, 图像_3, 图像_4, 图像_5, 图像_6, 图像_7, 图像_8, 图像_9, 图像_10]
+        images = [img for img in images if img is not None]
         
-        # 确定模型加载方式
-        use_local = 使用本地文件 or (模型选择方式 == "本地文件")
+        # 根据分析模式生成提示词
+        mode_prompts = {
+            "单图详细描述": "请详细描述这张图片，包括场景、物体、人物、色彩、风格等所有视觉元素。",
+            "多图对比分析": "请对比分析这些图片，指出它们的相似之处、差异、共同主题和各自特点。",
+            "多图故事创作": "请根据这些图片创作一个连贯的故事或叙事。",
+            "多图主题提取": "请从这些图片中提取共同的主题、概念和视觉元素。",
+            "艺术风格分析": "请分析这些图片的艺术风格、绘画技巧、色彩运用和构图特点。",
+            "技术细节分析": "请分析这些图片的技术细节，包括光线、角度、焦点、分辨率等。",
+            "情感氛围分析": "请描述这些图片传达的情感氛围和情绪感受。",
+            "创意灵感生成": "请基于这些图片生成创意灵感和设计思路。"
+        }
+        
+        # 确定使用的提示词
+        if 自定义提示词.strip():
+            user_prompt = 自定义提示词.strip()
+        else:
+            user_prompt = mode_prompts.get(分析模式, "请分析这些图片。")
+        
+        # 根据图像数量调整提示词
+        if len(images) > 1:
+            user_prompt = f"共有{len(images)}张图片。{user_prompt}"
+        
+        # 根据分析模式调整系统角色
+        role_specializations = {
+            "艺术风格分析": "艺术评论家",
+            "技术细节分析": "技术分析师", 
+            "情感氛围分析": "情感分析师",
+            "创意灵感生成": "创意顾问"
+        }
+        
+        specialization = role_specializations.get(分析模式, "视觉分析专家")
+        if specialization not in 系统角色定义:
+            系统角色定义 = f"你是{specialization}，{系统角色定义}"
+        
+        # 使用本地文件（默认启用）
+        use_local = 使用本地文件
         
         # 获取实际文件路径
+        model_source = "无"
+        mmproj_source = "无"
+        
         if use_local:
-            model_source = "无"
-            mmproj_source = "无"
-            
             # 查找模型文件路径
             local_gguf_files = _get_local_gguf_files()
             for file_path, display_name in local_gguf_files:
@@ -924,263 +1193,51 @@ class AILab_QwenVL_GGUF_Advanced(QwenVLGGUFBase):
                 mmproj_source = "无"
                 
             if model_source == "无":
-                raise ValueError("未选择有效的本地模型文件")
+                raise ValueError("请选择有效的本地模型文件")
         else:
-            model_source = model_name
-            mmproj_source = "无"  # 配置中的模型会自动处理mmproj
+            raise ValueError("本节点已配置为默认使用本地文件")
+        
+        print(f"[QwenVL] 高级分析模式: {分析模式}")
+        print(f"[QwenVL] 输入 {len(images)} 张图像")
+        print(f"[QwenVL] 使用设备: {device}")
+        
+        # 如果种子为-1，使用随机种子
+        effective_seed = seed if seed != -1 else random.randint(1, 2**32 - 1)
         
         return self.run(
             model_source=model_source,
             mmproj_source=mmproj_source,
             use_local_files=use_local,
-            preset_prompt=preset_prompt,
-            custom_prompt=custom_prompt,
+            system_prompt=系统角色定义,
+            user_prompt=user_prompt,
             images=images,
             video=video,
-            frame_count=frame_count,
+            frame_count=12,
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
             repetition_penalty=repetition_penalty,
-            seed=seed,
+            seed=effective_seed,
             keep_model_loaded=keep_model_loaded,
             device=device,
             ctx=ctx,
-            n_batch=n_batch,
+            n_batch=512,
             gpu_layers=gpu_layers,
-            image_max_tokens=image_max_tokens,
-            top_k=top_k,
-            pool_size=pool_size,
+            image_max_tokens=4096,
+            top_k=40,
+            pool_size=4194304,
         )
 
 
-class AILab_QwenVL_GGUF_MultiImageChat(QwenVLGGUFBase):
-    """多图对话节点 - 专门用于多图像对话场景"""
-    
-    @classmethod
-    def INPUT_TYPES(cls):
-        all_models = GGUF_VL_CATALOG.get("models") or {}
-        model_keys = sorted([key for key, entry in all_models.items() if (entry or {}).get("mmproj_filename")]) or ["(edit gguf_models.json)"]
-        default_model = model_keys[0] if model_keys else ""
-
-        # 获取本地文件
-        local_gguf_files = _get_local_gguf_files()
-        local_mmproj_files = _get_local_mmproj_files()
-        
-        # 多图对话专用提示词
-        multi_image_prompts = [
-            "比较这些图片的相似之处和差异",
-            "描述每张图片的内容",
-            "这些图片讲述了一个什么故事？",
-            "分析这些图片的共同主题",
-            "为这些图片创作一个连贯的描述",
-            "从这些图片中提取关键信息",
-            "这些图片反映了什么趋势或概念？",
-            "为每张图片生成简短的标题",
-        ]
-
-        return {
-            "required": {
-                "使用本地文件": ("BOOLEAN", {"default": False, "tooltip": "启用后使用本地GGUF文件，否则使用配置中的模型"}),
-                "模型选择方式": (["从配置选择", "本地文件"], {"default": "从配置选择", "tooltip": "选择模型加载方式"}),
-                "model_name": (model_keys, {"default": default_model, "tooltip": "从配置中选择模型"}),
-                "本地模型文件": (["无"] + [display for _, display in local_gguf_files], {"default": "无", "tooltip": "选择本地GGUF文件"}),
-                "本地mmproj文件": (["无"] + [display for _, display in local_mmproj_files], {"default": "无", "tooltip": "选择本地mmproj文件（视觉模型需要）"}),
-                "prompt_type": (["预设", "自定义"], {"default": "预设"}),
-                "preset_prompt": (multi_image_prompts, {"default": multi_image_prompts[0]}),
-                "custom_prompt": ("STRING", {"default": "", "multiline": True, "placeholder": "输入多图分析的提示词"}),
-                "max_tokens": ("INT", {"default": 1024, "min": 128, "max": 4096}),
-                "temperature": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 1.5}),
-                "seed": ("INT", {"default": 1, "min": 1, "max": 2**32 - 1}),
-            },
-            "optional": {
-                # 支持最多8张图像输入
-                "image_1": ("IMAGE",),
-                "image_2": ("IMAGE",),
-                "image_3": ("IMAGE",),
-                "image_4": ("IMAGE",),
-                "image_5": ("IMAGE",),
-                "image_6": ("IMAGE",),
-                "image_7": ("IMAGE",),
-                "image_8": ("IMAGE",),
-            },
-        }
-
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("多图分析结果",)
-    FUNCTION = "process_multi_image"
-    CATEGORY = "🧪AILab/QwenVL"
-
-    def process_multi_image(
-        self,
-        使用本地文件,
-        模型选择方式,
-        model_name,
-        本地模型文件,
-        本地mmproj文件,
-        prompt_type,
-        preset_prompt,
-        custom_prompt,
-        max_tokens,
-        temperature,
-        seed,
-        image_1=None,
-        image_2=None,
-        image_3=None,
-        image_4=None,
-        image_5=None,
-        image_6=None,
-        image_7=None,
-        image_8=None,
-    ):
-        # 收集所有图像输入
-        images = [image_1, image_2, image_3, image_4, image_5, image_6, image_7, image_8]
-        images = [img for img in images if img is not None]  # 过滤掉None值
-        
-        # 确定使用的提示词
-        if prompt_type == "自定义" and custom_prompt.strip():
-            prompt = custom_prompt.strip()
-        else:
-            prompt = preset_prompt
-        
-        # 确定模型加载方式
-        use_local = 使用本地文件 or (模型选择方式 == "本地文件")
-        
-        # 获取实际文件路径
-        if use_local:
-            model_source = "无"
-            mmproj_source = "无"
-            
-            # 查找模型文件路径
-            local_gguf_files = _get_local_gguf_files()
-            for file_path, display_name in local_gguf_files:
-                if display_name == 本地模型文件:
-                    model_source = file_path
-                    break
-            
-            # 查找mmproj文件路径
-            if 本地mmproj文件 != "无":
-                local_mmproj_files = _get_local_mmproj_files()
-                for file_path, display_name in local_mmproj_files:
-                    if display_name == 本地mmproj文件:
-                        mmproj_source = file_path
-                        break
-            else:
-                mmproj_source = "无"
-                
-            if model_source == "无":
-                raise ValueError("未选择有效的本地模型文件")
-        else:
-            model_source = model_name
-            mmproj_source = "无"  # 配置中的模型会自动处理mmproj
-        
-        print(f"[QwenVL] 多图分析: 输入 {len(images)} 张图像")
-        if images:
-            print(f"[QwenVL] 图像尺寸: {images[0].shape}")
-        
-        try:
-            self._load_model(
-                model_source=model_source,
-                mmproj_source=mmproj_source,
-                device="auto",
-                ctx=None,
-                n_batch=None,
-                gpu_layers=None,
-                image_max_tokens=None,
-                top_k=None,
-                pool_size=None,
-                is_local_file=use_local,
-            )
-            
-            # 转换图像为base64
-            images_b64: list[str] = []
-            for img_tensor in images:
-                if img_tensor is not None:
-                    img_b64 = _tensor_to_base64_png(img_tensor)
-                    if img_b64:
-                        images_b64.append(img_b64)
-            
-            # 生成多图分析
-            text = self._invoke(
-                system_prompt=(
-                    "You are a helpful vision-language assistant specialized in multi-image analysis. "
-                    "You can compare, contrast, and synthesize information from multiple images. "
-                    "Provide detailed and structured analysis."
-                ),
-                user_prompt=prompt,
-                images_b64=images_b64 if self.chat_handler is not None else [],
-                max_tokens=max_tokens,
-                temperature=temperature,
-                top_p=0.9,
-                repetition_penalty=1.1,
-                seed=seed,
-            )
-            return (text,)
-        finally:
-            # 默认清理模型以节省内存
-            self.clear()
-
-
-class AILab_QwenVL_GGUF_FileSelector:
-    """GGUF文件选择器节点 - 专门用于浏览和选择本地文件"""
-    
-    @classmethod
-    def INPUT_TYPES(cls):
-        local_gguf_files = _get_local_gguf_files()
-        local_mmproj_files = _get_local_mmproj_files()
-        
-        return {
-            "required": {
-                "刷新文件列表": ("BOOLEAN", {"default": False, "tooltip": "刷新本地文件列表"}),
-            },
-            "optional": {
-                "自定义搜索路径": ("STRING", {"default": "", "multiline": False, "placeholder": "输入自定义搜索路径（可选）"}),
-            }
-        }
-    
-    RETURN_TYPES = ("STRING", "STRING", "STRING", "STRING")
-    RETURN_NAMES = ("模型文件", "mmproj文件", "模型路径", "mmproj路径")
-    FUNCTION = "browse_files"
-    CATEGORY = "🧪AILab/QwenVL"
-    
-    def browse_files(self, 刷新文件列表, 自定义搜索路径=None):
-        """浏览本地文件"""
-        # 如果提供了自定义路径，添加到搜索路径
-        if 自定义搜索路径 and 自定义搜索路径.strip():
-            custom_path = Path(自定义搜索路径.strip())
-            if custom_path.exists():
-                print(f"[QwenVL] 使用自定义搜索路径: {custom_path}")
-        
-        # 刷新文件列表
-        local_gguf_files = _get_local_gguf_files()
-        local_mmproj_files = _get_local_mmproj_files()
-        
-        # 返回第一个文件作为示例
-        model_file_display = "无"
-        mmproj_file_display = "无"
-        model_file_path = ""
-        mmproj_file_path = ""
-        
-        if local_gguf_files:
-            model_file_path, model_file_display = local_gguf_files[0]
-            print(f"[QwenVL] 找到 {len(local_gguf_files)} 个GGUF文件")
-        
-        if len(local_mmproj_files) > 1:  # 跳过第一个"无"选项
-            mmproj_file_path, mmproj_file_display = local_mmproj_files[1]
-        
-        return (model_file_display, mmproj_file_display, model_file_path, mmproj_file_path)
-
+# 添加必要的import
+import random
 
 NODE_CLASS_MAPPINGS = {
     "AILab_QwenVL_GGUF": AILab_QwenVL_GGUF,
     "AILab_QwenVL_GGUF_Advanced": AILab_QwenVL_GGUF_Advanced,
-    "AILab_QwenVL_GGUF_MultiImageChat": AILab_QwenVL_GGUF_MultiImageChat,
-    "AILab_QwenVL_GGUF_FileSelector": AILab_QwenVL_GGUF_FileSelector,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "AILab_QwenVL_GGUF": "QwenVL (GGUF) - 多图输入+本地文件",
-    "AILab_QwenVL_GGUF_Advanced": "QwenVL Advanced (GGUF) - 多图输入+本地文件",
-    "AILab_QwenVL_GGUF_MultiImageChat": "QwenVL 多图对话 (GGUF) - 本地文件",
-    "AILab_QwenVL_GGUF_FileSelector": "QwenVL 文件选择器 (GGUF)",
+    "AILab_QwenVL_GGUF": "QwenVL 多图分析 (GGUF)",
+    "AILab_QwenVL_GGUF_Advanced": "QwenVL 高级多图分析 (GGUF)",
 }
